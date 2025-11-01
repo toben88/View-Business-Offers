@@ -1,0 +1,13 @@
+# Database files
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+*.tmp
+*.log
+
+# Backup files
+*.backup.php
+viewoffers.backup.php

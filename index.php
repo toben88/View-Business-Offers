@@ -1,7 +1,7 @@
 <?php
 /*
  * ============================================
- * OFFER COMPARISON TOOL FOR SELLERS v2.01
+ * OFFER COMPARISON TOOL FOR SELLERS v2.02
  * ============================================
  *
  * Purpose: Help sellers compare multiple offers side-by-side
@@ -242,7 +242,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['csrf_token']) && $_PO
         $validationErrors = validateOfferInput($_POST);
         if (!empty($validationErrors)) {
             $_SESSION['error_message'] = implode(' | ', $validationErrors);
-            header('Location: index.php');
+            header('Location: ' . $_SERVER['PHP_SELF']);
             exit;
         }
 
@@ -271,7 +271,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['csrf_token']) && $_PO
         $validationErrors = validateOfferInput($_POST);
         if (!empty($validationErrors)) {
             $_SESSION['error_message'] = implode(' | ', $validationErrors);
-            header('Location: index.php');
+            header('Location: ' . $_SERVER['PHP_SELF']);
             exit;
         }
 
@@ -294,17 +294,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['csrf_token']) && $_PO
         autoSaveComparison(); // Auto-save after editing offer
         unset($offer); // Break the reference
         // Redirect to clear the edit mode and prevent re-submission
-        header('Location: index.php');
+        header('Location: ' . $_SERVER['PHP_SELF']);
         exit;
     } elseif ($action === 'clear_all') {
         $_SESSION['offers'] = [];
         $_SESSION['current_comparison_id'] = null;
+        $_SESSION['skip_autoload'] = true; // Prevent auto-load after clearing
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit;
     } elseif ($action === 'save_comparison' && !empty($_POST['comparison_name'])) {
         // Validate comparison name
         $validationErrors = validateOfferInput($_POST);
         if (!empty($validationErrors)) {
             $_SESSION['error_message'] = implode(' | ', $validationErrors);
-            header('Location: index.php');
+            header('Location: ' . $_SERVER['PHP_SELF']);
             exit;
         }
 
@@ -319,7 +322,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['csrf_token']) && $_PO
                 $_SESSION['error_message'] = "Error saving comparison. Please try again.";
             }
         }
-        header('Location: index.php');
+        header('Location: ' . $_SERVER['PHP_SELF']);
         exit;
     } elseif ($action === 'load_comparison' && !empty($_POST['comparison_id'])) {
         // Load comparison from database
@@ -336,7 +339,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['csrf_token']) && $_PO
         } catch (Exception $e) {
             $_SESSION['error_message'] = "Error loading comparison. Please try again.";
         }
-        header('Location: index.php');
+        header('Location: ' . $_SERVER['PHP_SELF']);
         exit;
     } elseif ($action === 'delete_comparison' && !empty($_POST['comparison_id'])) {
         // Delete comparison from database
@@ -351,7 +354,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['csrf_token']) && $_PO
         } catch (Exception $e) {
             $_SESSION['error_message'] = "Error deleting comparison. Please try again.";
         }
-        header('Location: index.php');
+        header('Location: ' . $_SERVER['PHP_SELF']);
         exit;
     }
 }
@@ -371,26 +374,33 @@ function calculateTotalPayments($principal, $annualRate, $months, $timeframe) {
     return $monthlyPayment * $actualMonths;
 }
 
-// Always load the most recent comparison from database (for cross-browser/computer sync)
-// This ensures all sessions see the same data
-$savedComparisons = getAllComparisons();
-if (count($savedComparisons) > 0) {
-    $mostRecentComparison = $savedComparisons[0]; // Already sorted by updated_at DESC
-    try {
-        $data = loadComparison($mostRecentComparison['id']);
-        if ($data) {
-            $_SESSION['offers'] = $data['offers'];
-            $_SESSION['current_comparison_id'] = $mostRecentComparison['id'];
+// Check if we should skip auto-load (e.g., after Clear All)
+if (isset($_SESSION['skip_autoload']) && $_SESSION['skip_autoload'] === true) {
+    unset($_SESSION['skip_autoload']);
+    $_SESSION['offers'] = [];
+    $_SESSION['current_comparison_id'] = null;
+} else {
+    // Always load the most recent comparison from database (for cross-browser/computer sync)
+    // This ensures all sessions see the same data
+    $savedComparisons = getAllComparisons();
+    if (count($savedComparisons) > 0) {
+        $mostRecentComparison = $savedComparisons[0]; // Already sorted by updated_at DESC
+        try {
+            $data = loadComparison($mostRecentComparison['id']);
+            if ($data) {
+                $_SESSION['offers'] = $data['offers'];
+                $_SESSION['current_comparison_id'] = $mostRecentComparison['id'];
+            }
+        } catch (Exception $e) {
+            // Silently fail - use empty offers
+            $_SESSION['offers'] = [];
+            $_SESSION['current_comparison_id'] = null;
         }
-    } catch (Exception $e) {
-        // Silently fail - use empty offers
+    } else {
+        // No saved comparisons - start fresh
         $_SESSION['offers'] = [];
         $_SESSION['current_comparison_id'] = null;
     }
-} else {
-    // No saved comparisons - start fresh
-    $_SESSION['offers'] = [];
-    $_SESSION['current_comparison_id'] = null;
 }
 
 $offers = $_SESSION['offers'] ?? [];
@@ -525,7 +535,7 @@ html,body{height:100%;font-family:Inter,system-ui,-apple-system; background:var(
   <div class="card">
     <h2><?php echo $editingOffer ? '✏️ Edit Offer' : '➕ Add New Offer'; ?></h2>
     <?php if ($editingOffer): ?>
-      <p style="color:#06b6d4;margin-bottom:15px;">Editing: <strong><?php echo htmlspecialchars($editingOffer['buyer_name']); ?></strong> | <a href="index.php" style="color:#ef4444;">Cancel</a></p>
+      <p style="color:#06b6d4;margin-bottom:15px;">Editing: <strong><?php echo htmlspecialchars($editingOffer['buyer_name']); ?></strong> | <a href="<?php echo $_SERVER['PHP_SELF']; ?>" style="color:#ef4444;">Cancel</a></p>
     <?php endif; ?>
     <form method="POST" action="">
       <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
@@ -586,7 +596,7 @@ html,body{height:100%;font-family:Inter,system-ui,-apple-system; background:var(
       <div style="margin-top:15px;">
         <button type="submit" class="btn btn-success" onclick="return validateOffer()"><?php echo $editingOffer ? 'Update Offer' : 'Add Offer to Comparison'; ?></button>
         <?php if ($editingOffer): ?>
-          <a href="index.php" class="btn btn-ghost" style="margin-left:10px;">Cancel</a>
+          <a href="<?php echo $_SERVER['PHP_SELF']; ?>" class="btn btn-ghost" style="margin-left:10px;">Cancel</a>
         <?php endif; ?>
       </div>
     </form>
@@ -602,7 +612,7 @@ html,body{height:100%;font-family:Inter,system-ui,-apple-system; background:var(
 
   <!-- Comparison Summary Table -->
   <div class="card">
-    <h2>📋 Quick Comparison Summary</h2>
+    <h2>Quick Comparison Summary</h2>
     <table class="comparison-table">
       <thead>
         <tr>
@@ -638,7 +648,7 @@ html,body{height:100%;font-family:Inter,system-ui,-apple-system; background:var(
   </div>
 
   <!-- Offers Grid -->
-  <h2 style="margin-bottom:15px;">📝 Detailed Offer Comparison (<?php echo count($offers); ?> Offers)</h2>
+  <h2 style="margin-bottom:15px;">Detailed Offer Comparison (<?php echo count($offers); ?> Offers)</h2>
   <div style="margin-bottom:15px;">
     <form method="POST" action="" style="display:inline;">
       <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
@@ -746,7 +756,7 @@ html,body{height:100%;font-family:Inter,system-ui,-apple-system; background:var(
 
   <!-- Save/Load/Manage Section -->
   <div class="card">
-    <h2>💾 Save or Load Comparison</h2>
+    <h2>Save or Load Comparison</h2>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px;">
       <!-- Save Current Comparison -->
       <div>
@@ -790,7 +800,7 @@ html,body{height:100%;font-family:Inter,system-ui,-apple-system; background:var(
     <!-- Manage Saved Comparisons -->
     <?php if (count($savedComparisons) > 0): ?>
     <div style="border-top:1px solid var(--border);padding-top:20px;">
-      <h3 style="font-size:1rem;margin-bottom:15px;">🗂️ Manage Saved Comparisons</h3>
+      <h3 style="font-size:1rem;margin-bottom:15px;">Manage Saved Comparisons</h3>
       <div style="display:grid;gap:10px;">
         <?php foreach ($savedComparisons as $comp): ?>
         <div style="display:flex;justify-content:space-between;align-items:center;padding:12px;background:#f8f9fa;border-radius:8px;border:1px solid var(--border);">
@@ -817,7 +827,7 @@ html,body{height:100%;font-family:Inter,system-ui,-apple-system; background:var(
   </div>
 
   <div class="footer">
-    Offer Comparison Tool v2.01 | © 2025 Rico Vision LLC
+    Offer Comparison Tool v2.02 | © 2025 Rico Vision LLC
   </div>
 </div>
 
@@ -837,17 +847,32 @@ document.addEventListener('DOMContentLoaded', function() {
   const months = Array.from({length: 121}, (_, i) => i); // 0 to 120
 
   const datasets = offers.map((offer, index) => {
+    // Original vibrant colors (commented out)
+    // const colors = [
+    //   '#06b6d4', // cyan
+    //   '#8b5cf6', // purple
+    //   '#f59e0b', // amber
+    //   '#10b981', // green
+    //   '#ef4444', // red
+    //   '#ec4899', // pink
+    //   '#14b8a6', // teal
+    //   '#f97316', // orange
+    //   '#6366f1', // indigo
+    //   '#84cc16', // lime
+    // ];
+
+    // Professional business presentation colors
     const colors = [
-      '#06b6d4', // cyan
-      '#8b5cf6', // purple
-      '#f59e0b', // amber
-      '#10b981', // green
-      '#ef4444', // red
-      '#ec4899', // pink
-      '#14b8a6', // teal
-      '#f97316', // orange
-      '#6366f1', // indigo
-      '#84cc16', // lime
+      '#1f77b4', // professional blue
+      '#2ca02c', // business green
+      '#d62728', // corporate red
+      '#ff7f0e', // executive orange
+      '#9467bd', // sophisticated purple
+      '#8c564b', // warm brown
+      '#e377c2', // muted pink
+      '#7f7f7f', // neutral gray
+      '#bcbd22', // olive gold
+      '#17becf', // teal blue
     ];
 
     const color = colors[index % colors.length];

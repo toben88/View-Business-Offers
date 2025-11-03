@@ -1,4 +1,4 @@
-# Offer Comparison Tool v2.01
+# Offer Comparison Tool v2.02
 
 A production-ready web application for business sellers to compare multiple acquisition offers side-by-side. Features interactive visualizations, seller note tracking with balloon payments, and persistent data storage.
 
@@ -23,7 +23,7 @@ A production-ready web application for business sellers to compare multiple acqu
 
 ```
 buyeroffers/
-├── index.php         # Main application (v2.01)
+├── index.php         # Main application (v2.02)
 ├── database.php           # SQLite database handler
 ├── data/                  # Database storage directory (auto-created)
 │   ├── .htaccess         # Blocks direct web access to database
@@ -209,7 +209,14 @@ Before deploying to production:
 
 ## Version History
 
-### v2.01 (Current)
+### v2.02 (Current)
+- **Fixed Clear All button**: Resolved issue where offers were immediately reloaded after clearing
+- **Fixed all redirect paths**: All redirects now use `$_SERVER['PHP_SELF']` for proper portability
+- **Professional chart colors**: Updated timeline graph to use business-appropriate color palette
+- **Cleaner UI**: Removed emoji icons from section headings for more professional appearance
+- Fixed "Cancel" edit links to work correctly in all directory configurations
+
+### v2.01
 - **Auto-save functionality**: Automatically saves to database after every add/edit/delete operation
 - **Cross-browser/computer sync**: Always loads most recent comparison from database on page load
 - **Fixed edit button**: Resolved issue with editing offers loaded from database

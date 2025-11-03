@@ -141,9 +141,14 @@ function loadComparison($comparisonId) {
     $stmt->execute([$comparisonId]);
     $offers = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // Convert boolean fields
+    // Convert boolean fields and add unique ID for edit functionality
     foreach ($offers as &$offer) {
         $offer['has_balloon'] = (bool)$offer['has_balloon'];
+        // Use database ID as the unique identifier for editing
+        // Keep 'id' as string to match uniqid() format used in session
+        if (!isset($offer['id']) || is_numeric($offer['id'])) {
+            $offer['id'] = 'db_' . $offer['id'];
+        }
     }
 
     return [

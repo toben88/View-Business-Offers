@@ -1,0 +1,960 @@
+<?php
+/*
+ * ============================================
+ * OFFER COMPARISON TOOL FOR SELLERS v2.0
+ * ============================================
+ *
+ * Purpose: Help sellers compare multiple offers side-by-side
+ * Features:
+ * - Compare unlimited offers simultaneously
+ * - See total cash at closing for each offer
+ * - View seller note terms (amount, rate, duration)
+ * - Visualize cash flow timeline with interactive graphs
+ * - Calculate total payments over 5 and 10 years
+ * - Save and load comparison scenarios
+ * - SQLite database persistence
+ *
+ */
+
+// Enable error reporting for debugging
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+
+// Security: Set security headers
+header("X-Content-Type-Options: nosniff");
+header("X-Frame-Options: DENY");
+header("X-XSS-Protection: 1; mode=block");
+header("Referrer-Policy: strict-origin-when-cross-origin");
+header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self';");
+
+// Include database handler (relative path)
+require_once __DIR__ . '/database.php';
+
+// Security: Session configuration
+ini_set('session.cookie_httponly', 1);  // Prevent JavaScript access to session cookie
+ini_set('session.cookie_samesite', 'Strict'); // CSRF protection
+ini_set('session.use_strict_mode', 1);   // Reject uninitialized session IDs
+
+// Start session
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
+// Security: Rate limiting (50 requests per hour per IP)
+function checkRateLimit() {
+    $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    $limit = 50; // requests per hour
+    $window = 3600; // 1 hour in seconds
+
+    // Use session-based rate limiting for simplicity
+    if (!isset($_SESSION['rate_limit'])) {
+        $_SESSION['rate_limit'] = [
+            'count' => 0,
+            'start_time' => time()
+        ];
+    }
+
+    $elapsed = time() - $_SESSION['rate_limit']['start_time'];
+
+    // Reset counter if window expired
+    if ($elapsed > $window) {
+        $_SESSION['rate_limit'] = [
+            'count' => 1,
+            'start_time' => time()
+        ];
+        return true;
+    }
+
+    // Check if limit exceeded
+    if ($_SESSION['rate_limit']['count'] >= $limit) {
+        http_response_code(429); // Too Many Requests
+        die('Rate limit exceeded. Please try again later.');
+    }
+
+    // Increment counter
+    $_SESSION['rate_limit']['count']++;
+    return true;
+}
+
+// Check rate limit for POST requests
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    checkRateLimit();
+}
+
+// Generate CSRF token
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+// Initialize session tracking
+if (!isset($_SESSION['current_comparison_id'])) {
+    $_SESSION['current_comparison_id'] = null;
+}
+
+// Initialize offers in session (temporary working set)
+if (!isset($_SESSION['offers'])) {
+    $_SESSION['offers'] = [];
+}
+
+// Security: Input validation function
+function validateOfferInput($data) {
+    $errors = [];
+
+    // Purchase Price: $1 to $10 billion (only validate if provided)
+    if (isset($data['purchase_price']) && $data['purchase_price'] !== '') {
+        $price = floatval($data['purchase_price']);
+        if ($price < 1 || $price > 10000000000) {
+            $errors[] = 'Purchase price must be between $1 and $10,000,000,000';
+        }
+    }
+
+    // Down Payment: $0 to Purchase Price (only validate if provided)
+    if (isset($data['down_payment']) && $data['down_payment'] !== '' && isset($data['purchase_price']) && $data['purchase_price'] !== '') {
+        $down = floatval($data['down_payment']);
+        $price = floatval($data['purchase_price']);
+        if ($down < 0 || $down > $price) {
+            $errors[] = 'Down payment must be between $0 and purchase price';
+        }
+    }
+
+    // Seller Note Amount: $0 to Purchase Price (only validate if provided)
+    if (isset($data['seller_note_amount']) && $data['seller_note_amount'] !== '' && isset($data['purchase_price']) && $data['purchase_price'] !== '') {
+        $note = floatval($data['seller_note_amount']);
+        $price = floatval($data['purchase_price']);
+        if ($note < 0 || $note > $price) {
+            $errors[] = 'Seller note amount must be between $0 and purchase price';
+        }
+    }
+
+    // Seller Note Rate: 0% to 50% (only validate if provided)
+    if (isset($data['seller_note_rate']) && $data['seller_note_rate'] !== '') {
+        $rate = floatval($data['seller_note_rate']);
+        if ($rate < 0 || $rate > 50) {
+            $errors[] = 'Seller note rate must be between 0% and 50%';
+        }
+    }
+
+    // Seller Note Duration: 1 to 480 months (only validate if provided)
+    if (isset($data['seller_note_duration']) && $data['seller_note_duration'] !== '') {
+        $duration = intval($data['seller_note_duration']);
+        if ($duration < 1 || $duration > 480) {
+            $errors[] = 'Seller note duration must be between 1 and 480 months';
+        }
+    }
+
+    // Balloon Year: 1 to 30 years (only validate if provided)
+    if (isset($data['balloon_year']) && $data['balloon_year'] !== '') {
+        $balloonYear = intval($data['balloon_year']);
+        if ($balloonYear < 1 || $balloonYear > 30) {
+            $errors[] = 'Balloon year must be between 1 and 30 years';
+        }
+    }
+
+    // Buyer Name: Max 255 characters (only validate if provided)
+    if (isset($data['buyer_name']) && $data['buyer_name'] !== '') {
+        $name = strip_tags($data['buyer_name']);
+        if (strlen($name) > 255) {
+            $errors[] = 'Buyer name must be 255 characters or less';
+        }
+    }
+
+    // Contingencies: Max 5000 characters (only validate if provided)
+    if (isset($data['contingencies']) && $data['contingencies'] !== '') {
+        $contingencies = strip_tags($data['contingencies']);
+        if (strlen($contingencies) > 5000) {
+            $errors[] = 'Contingencies must be 5000 characters or less';
+        }
+    }
+
+    // Comparison Name: Max 255 characters (only validate if provided)
+    if (isset($data['comparison_name']) && $data['comparison_name'] !== '') {
+        $compName = strip_tags($data['comparison_name']);
+        if (strlen($compName) > 255) {
+            $errors[] = 'Comparison name must be 255 characters or less';
+        }
+    }
+
+    return $errors;
+}
+
+// Handle form submission
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['csrf_token']) && $_POST['csrf_token'] === $_SESSION['csrf_token']) {
+    $action = $_POST['action'] ?? '';
+
+    if ($action === 'add_offer') {
+        // Validate input
+        $validationErrors = validateOfferInput($_POST);
+        if (!empty($validationErrors)) {
+            $_SESSION['error_message'] = implode(' | ', $validationErrors);
+            header('Location: index.php');
+            exit;
+        }
+
+        $offer = [
+            'id' => uniqid(),
+            'buyer_name' => isset($_POST['buyer_name']) && $_POST['buyer_name'] !== '' ? strip_tags($_POST['buyer_name']) : 'BuyerName',
+            'purchase_price' => isset($_POST['purchase_price']) && $_POST['purchase_price'] !== '' ? floatval($_POST['purchase_price']) : 1000000,
+            'down_payment' => isset($_POST['down_payment']) && $_POST['down_payment'] !== '' ? floatval($_POST['down_payment']) : 750000,
+            'seller_note_amount' => isset($_POST['seller_note_amount']) && $_POST['seller_note_amount'] !== '' ? floatval($_POST['seller_note_amount']) : 250000,
+            'seller_note_rate' => isset($_POST['seller_note_rate']) && $_POST['seller_note_rate'] !== '' ? floatval($_POST['seller_note_rate']) : 7.00,
+            'seller_note_duration' => isset($_POST['seller_note_duration']) && $_POST['seller_note_duration'] !== '' ? intval($_POST['seller_note_duration']) : 120,
+            'has_balloon' => isset($_POST['has_balloon']) && $_POST['has_balloon'] === 'yes',
+            'balloon_year' => isset($_POST['balloon_year']) && $_POST['balloon_year'] !== '' ? intval($_POST['balloon_year']) : 5,
+            'contingencies' => strip_tags($_POST['contingencies'] ?? ''),
+        ];
+        $_SESSION['offers'][] = $offer;
+    } elseif ($action === 'delete_offer' && isset($_POST['offer_id'])) {
+        $_SESSION['offers'] = array_filter($_SESSION['offers'], function($o) {
+            return $o['id'] !== $_POST['offer_id'];
+        });
+        $_SESSION['offers'] = array_values($_SESSION['offers']); // Re-index
+    } elseif ($action === 'update_offer' && isset($_POST['offer_id'])) {
+        // Validate input
+        $validationErrors = validateOfferInput($_POST);
+        if (!empty($validationErrors)) {
+            $_SESSION['error_message'] = implode(' | ', $validationErrors);
+            header('Location: index.php');
+            exit;
+        }
+
+        $offerId = $_POST['offer_id'];
+        foreach ($_SESSION['offers'] as $key => &$offer) {
+            if ($offer['id'] === $offerId) {
+                $offer['buyer_name'] = strip_tags($_POST['buyer_name'] ?? 'Unnamed Buyer');
+                $offer['purchase_price'] = floatval($_POST['purchase_price'] ?? 0);
+                $offer['down_payment'] = floatval($_POST['down_payment'] ?? 0);
+                $offer['seller_note_amount'] = floatval($_POST['seller_note_amount'] ?? 0);
+                $offer['seller_note_rate'] = floatval($_POST['seller_note_rate'] ?? 0);
+                $offer['seller_note_duration'] = intval($_POST['seller_note_duration'] ?? 120);
+                $offer['has_balloon'] = isset($_POST['has_balloon']) && $_POST['has_balloon'] === 'yes';
+                $offer['balloon_year'] = !empty($_POST['balloon_year']) ? intval($_POST['balloon_year']) : 5;
+                $offer['contingencies'] = strip_tags($_POST['contingencies'] ?? '');
+                $_SESSION['offers'][$key] = $offer;
+                break;
+            }
+        }
+        unset($offer); // Break the reference
+        // Redirect to clear the edit mode and prevent re-submission
+        header('Location: index.php');
+        exit;
+    } elseif ($action === 'clear_all') {
+        $_SESSION['offers'] = [];
+        $_SESSION['current_comparison_id'] = null;
+    } elseif ($action === 'save_comparison' && !empty($_POST['comparison_name'])) {
+        // Validate comparison name
+        $validationErrors = validateOfferInput($_POST);
+        if (!empty($validationErrors)) {
+            $_SESSION['error_message'] = implode(' | ', $validationErrors);
+            header('Location: index.php');
+            exit;
+        }
+
+        // Save current offers to database
+        $comparisonName = strip_tags($_POST['comparison_name']);
+        if (count($_SESSION['offers']) > 0) {
+            try {
+                $comparisonId = saveComparison($comparisonName, $_SESSION['offers']);
+                $_SESSION['current_comparison_id'] = $comparisonId;
+                $_SESSION['save_message'] = "Comparison '$comparisonName' saved successfully!";
+            } catch (Exception $e) {
+                $_SESSION['error_message'] = "Error saving comparison. Please try again.";
+            }
+        }
+        header('Location: index.php');
+        exit;
+    } elseif ($action === 'load_comparison' && !empty($_POST['comparison_id'])) {
+        // Load comparison from database
+        $comparisonId = intval($_POST['comparison_id']);
+        try {
+            $data = loadComparison($comparisonId);
+            if ($data) {
+                $_SESSION['offers'] = $data['offers'];
+                $_SESSION['current_comparison_id'] = $comparisonId;
+                $_SESSION['save_message'] = "Comparison '" . htmlspecialchars($data['comparison']['name']) . "' loaded successfully!";
+            } else {
+                $_SESSION['error_message'] = "Comparison not found.";
+            }
+        } catch (Exception $e) {
+            $_SESSION['error_message'] = "Error loading comparison. Please try again.";
+        }
+        header('Location: index.php');
+        exit;
+    } elseif ($action === 'delete_comparison' && !empty($_POST['comparison_id'])) {
+        // Delete comparison from database
+        $comparisonId = intval($_POST['comparison_id']);
+        try {
+            deleteComparison($comparisonId);
+            if ($_SESSION['current_comparison_id'] == $comparisonId) {
+                $_SESSION['offers'] = [];
+                $_SESSION['current_comparison_id'] = null;
+            }
+            $_SESSION['save_message'] = "Comparison deleted successfully!";
+        } catch (Exception $e) {
+            $_SESSION['error_message'] = "Error deleting comparison. Please try again.";
+        }
+        header('Location: index.php');
+        exit;
+    }
+}
+
+// Calculate monthly payment
+function calculateMonthlyPayment($principal, $annualRate, $months) {
+    if ($principal <= 0 || $months <= 0) return 0;
+    $monthlyRate = ($annualRate / 100) / 12;
+    if ($monthlyRate == 0) return $principal / $months;
+    return $principal * ($monthlyRate * pow(1 + $monthlyRate, $months)) / (pow(1 + $monthlyRate, $months) - 1);
+}
+
+// Calculate total payments over time
+function calculateTotalPayments($principal, $annualRate, $months, $timeframe) {
+    $monthlyPayment = calculateMonthlyPayment($principal, $annualRate, $months);
+    $actualMonths = min($timeframe, $months);
+    return $monthlyPayment * $actualMonths;
+}
+
+$offers = $_SESSION['offers'] ?? [];
+
+// Auto-load first comparison if no offers and no current comparison loaded
+if (count($offers) === 0 && $_SESSION['current_comparison_id'] === null) {
+    $savedComparisons = getAllComparisons();
+    if (count($savedComparisons) > 0) {
+        $firstComparison = $savedComparisons[0];
+        try {
+            $data = loadComparison($firstComparison['id']);
+            if ($data) {
+                $_SESSION['offers'] = $data['offers'];
+                $_SESSION['current_comparison_id'] = $firstComparison['id'];
+                $offers = $_SESSION['offers'];
+            }
+        } catch (Exception $e) {
+            // Silently fail - just don't load anything
+        }
+    }
+}
+
+// Check if we're in edit mode
+$editingOffer = null;
+if (isset($_GET['edit_id'])) {
+    foreach ($offers as $offer) {
+        if ($offer['id'] === $_GET['edit_id']) {
+            $editingOffer = $offer;
+            break;
+        }
+    }
+}
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Offer Comparison Tool - View Multiple Offers</title>
+<link rel="preconnect" href="https://fonts.gstatic.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root{
+  --bg: #f6f9fc;
+  --card: #ffffff;
+  --muted: #5b6b7a;
+  --accent: linear-gradient(135deg,#06b6d4 0%,#3b82f6 100%);
+  --success: #10b981;
+  --danger: #ef4444;
+  --text: #0b1220;
+  --border: rgba(203, 213, 225, 0.5);
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;font-family:Inter,system-ui,-apple-system; background:var(--bg); color:var(--text);padding:10px;}
+
+.container{max-width:1600px;margin:0 auto;padding:15px;}
+
+/* Header */
+.header{background:linear-gradient(135deg,#06b6d4 0%,#3b82f6 100%);color:white;padding:25px;border-radius:14px;margin-bottom:20px;box-shadow:0 6px 18px rgba(6,182,212,0.4);}
+.header h1{font-size:1.8rem;margin-bottom:8px;}
+.header p{font-size:0.95rem;opacity:0.9;}
+
+/* Buttons */
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 18px;border-radius:10px;border:none;cursor:pointer;font-weight:600;font-size:0.9rem;transition:all 0.2s;}
+.btn-primary{background:linear-gradient(135deg,#06b6d4 0%,#3b82f6 100%);color:white;box-shadow:0 4px 12px rgba(59,130,246,0.3);}
+.btn-success{background:linear-gradient(135deg,#10b981 0%,#059669 100%);color:white;box-shadow:0 4px 12px rgba(16,185,129,0.3);}
+.btn-danger{background:linear-gradient(135deg,#ef4444 0%,#dc2626 100%);color:white;box-shadow:0 4px 12px rgba(239,68,68,0.3);}
+.btn-ghost{background:white;border:1px solid var(--border);color:var(--text);}
+.btn:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(0,0,0,0.15);}
+.btn:active{transform:translateY(0);}
+
+/* Cards */
+.card{background:var(--card);border-radius:14px;padding:20px;box-shadow:0 4px 12px rgba(2,6,23,0.08);border:1px solid var(--border);margin-bottom:20px;}
+.card h2{font-size:1.3rem;margin-bottom:15px;color:var(--text);}
+.card h3{font-size:1.1rem;margin-bottom:12px;color:var(--text);}
+
+/* Form */
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:15px;margin-bottom:15px;}
+.form-group{display:flex;flex-direction:column;}
+.form-group label{font-size:0.85rem;margin-bottom:6px;color:var(--muted);font-weight:600;}
+.form-group input,.form-group textarea{padding:10px 12px;border-radius:8px;border:1px solid var(--border);background:white;font-size:0.9rem;}
+.form-group input::placeholder,.form-group textarea::placeholder{color:#9ca3af;opacity:1;}
+.form-group textarea{resize:vertical;min-height:60px;}
+
+/* Offer Comparison Grid */
+.offers-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px;margin-top:20px;}
+
+.offer-card{background:white;border-radius:14px;padding:20px;border:3px solid var(--border);box-shadow:0 4px 12px rgba(2,6,23,0.08);position:relative;}
+.offer-card.best{border-color:#10b981;box-shadow:0 6px 20px rgba(16,185,129,0.3);}
+.offer-card.best::before{content:"HIGHEST TOTAL";position:absolute;top:-12px;left:20px;background:#10b981;color:white;padding:4px 12px;border-radius:6px;font-size:0.75rem;font-weight:700;}
+
+.offer-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;padding-bottom:12px;border-bottom:2px solid var(--border);}
+.offer-header h3{margin:0;font-size:1.2rem;}
+
+.metric{margin-bottom:12px;}
+.metric-label{font-size:0.8rem;color:var(--muted);margin-bottom:4px;}
+.metric-value{font-size:1.3rem;font-weight:700;color:var(--text);}
+.metric-value.highlight{color:#10b981;font-size:1.5rem;}
+
+.timeline-section{margin-top:15px;padding-top:15px;border-top:2px solid var(--border);}
+
+.edit-btn{background:#06b6d4;color:white;border:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:0.8rem;text-decoration:none;display:inline-block;}
+.edit-btn:hover{background:#0891b2;}
+.delete-btn{background:#ef4444;color:white;border:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:0.8rem;}
+.delete-btn:hover{background:#dc2626;}
+
+/* Graph container */
+.graph-container{background:white;border-radius:14px;padding:25px;box-shadow:0 4px 12px rgba(2,6,23,0.08);border:1px solid var(--border);margin-bottom:20px;}
+.graph-container h2{margin-bottom:20px;}
+
+/* Empty state */
+.empty-state{text-align:center;padding:60px 20px;color:var(--muted);}
+.empty-state svg{width:80px;height:80px;margin-bottom:20px;opacity:0.3;}
+
+/* Footer */
+.footer{text-align:center;padding:20px;color:var(--muted);font-size:0.85rem;}
+
+.comparison-table{width:100%;border-collapse:collapse;margin-top:15px;}
+.comparison-table th,.comparison-table td{padding:10px;text-align:left;border-bottom:1px solid var(--border);}
+.comparison-table th{font-weight:700;font-size:0.85rem;color:var(--muted);}
+.comparison-table td{font-size:0.9rem;}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>🤝 Offer Comparison Tool</h1>
+    <p>Compare multiple offers side-by-side to make the best decision for your business sale</p>
+  </div>
+
+  <!-- Success/Error Messages -->
+  <?php if (isset($_SESSION['save_message'])): ?>
+    <div class="card" style="background:#ecfdf5;border-left:4px solid #10b981;margin-bottom:20px;">
+      <p style="color:#10b981;margin:0;">✓ <?php echo htmlspecialchars($_SESSION['save_message']); ?></p>
+    </div>
+    <?php unset($_SESSION['save_message']); ?>
+  <?php endif; ?>
+
+  <?php if (isset($_SESSION['error_message'])): ?>
+    <div class="card" style="background:#fef2f2;border-left:4px solid #ef4444;margin-bottom:20px;">
+      <p style="color:#ef4444;margin:0;">✗ <?php echo htmlspecialchars($_SESSION['error_message']); ?></p>
+    </div>
+    <?php unset($_SESSION['error_message']); ?>
+  <?php endif; ?>
+
+  <!-- Add New Offer Form -->
+  <div class="card">
+    <h2><?php echo $editingOffer ? '✏️ Edit Offer' : '➕ Add New Offer'; ?></h2>
+    <?php if ($editingOffer): ?>
+      <p style="color:#06b6d4;margin-bottom:15px;">Editing: <strong><?php echo htmlspecialchars($editingOffer['buyer_name']); ?></strong> | <a href="index.php" style="color:#ef4444;">Cancel</a></p>
+    <?php endif; ?>
+    <form method="POST" action="">
+      <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+      <input type="hidden" name="action" value="<?php echo $editingOffer ? 'update_offer' : 'add_offer'; ?>">
+      <?php if ($editingOffer): ?>
+        <input type="hidden" name="offer_id" value="<?php echo $editingOffer['id']; ?>">
+      <?php endif; ?>
+
+      <div class="form-grid">
+        <div class="form-group">
+          <label for="buyer_name">Buyer Name / Offer Label</label>
+          <input type="text" id="buyer_name" name="buyer_name" placeholder="BuyerName" value="<?php echo $editingOffer ? htmlspecialchars($editingOffer['buyer_name']) : ''; ?>">
+        </div>
+
+        <div class="form-group">
+          <label for="purchase_price">Purchase Price</label>
+          <input type="number" id="purchase_price" name="purchase_price" step="1" placeholder="$1,000,000" value="<?php echo $editingOffer ? $editingOffer['purchase_price'] : ''; ?>">
+        </div>
+
+        <div class="form-group">
+          <label for="down_payment">Cash at Closing (Down Payment)</label>
+          <input type="number" id="down_payment" name="down_payment" step="1" placeholder="$750,000" value="<?php echo $editingOffer ? $editingOffer['down_payment'] : ''; ?>">
+        </div>
+
+        <div class="form-group">
+          <label for="seller_note_amount">Seller Note Amount</label>
+          <input type="number" id="seller_note_amount" name="seller_note_amount" step="1" placeholder="$250,000" value="<?php echo $editingOffer ? $editingOffer['seller_note_amount'] : ''; ?>">
+        </div>
+
+        <div class="form-group">
+          <label for="seller_note_rate">Seller Note Interest Rate (%)</label>
+          <input type="number" id="seller_note_rate" name="seller_note_rate" step="0.01" placeholder="7.00" value="<?php echo $editingOffer ? $editingOffer['seller_note_rate'] : ''; ?>">
+        </div>
+
+        <div class="form-group">
+          <label for="seller_note_duration">Seller Note Duration (Months)</label>
+          <input type="number" id="seller_note_duration" name="seller_note_duration" step="1" placeholder="120" value="<?php echo $editingOffer ? $editingOffer['seller_note_duration'] : ''; ?>">
+        </div>
+
+        <div class="form-group">
+          <label for="has_balloon">
+            <input type="checkbox" id="has_balloon" name="has_balloon" value="yes" <?php echo ($editingOffer && !empty($editingOffer['has_balloon'])) ? 'checked' : ''; ?> onchange="toggleBalloonYear()">
+            Balloon Payment on Seller Note
+          </label>
+        </div>
+
+        <div class="form-group" id="balloon_year_group" style="display:<?php echo ($editingOffer && !empty($editingOffer['has_balloon'])) ? 'flex' : 'none'; ?>;">
+          <label for="balloon_year">Balloon Payment Year</label>
+          <input type="number" id="balloon_year" name="balloon_year" step="1" min="1" max="10" placeholder="5" value="<?php echo $editingOffer ? ($editingOffer['balloon_year'] ?? 5) : ''; ?>">
+        </div>
+
+        <div class="form-group">
+          <label for="contingencies">Contingencies / Notes</label>
+          <textarea id="contingencies" name="contingencies" placeholder="e.g., Subject to financing, Due diligence period, etc."><?php echo $editingOffer ? htmlspecialchars($editingOffer['contingencies']) : ''; ?></textarea>
+        </div>
+      </div>
+
+      <div style="margin-top:15px;">
+        <button type="submit" class="btn btn-success" onclick="return validateOffer()"><?php echo $editingOffer ? 'Update Offer' : 'Add Offer to Comparison'; ?></button>
+        <?php if ($editingOffer): ?>
+          <a href="index.php" class="btn btn-ghost" style="margin-left:10px;">Cancel</a>
+        <?php endif; ?>
+      </div>
+    </form>
+  </div>
+
+  <?php if (count($offers) > 0): ?>
+
+  <!-- Cash Flow Visualization Graph -->
+  <div class="graph-container">
+    <h2>📊 Cash Flow Timeline - Money Received Over Time</h2>
+    <canvas id="cashflowChart" height="80"></canvas>
+  </div>
+
+  <!-- Comparison Summary Table -->
+  <div class="card">
+    <h2>📋 Quick Comparison Summary</h2>
+    <table class="comparison-table">
+      <thead>
+        <tr>
+          <th>Buyer</th>
+          <th>Purchase Price</th>
+          <th>Cash at Closing</th>
+          <th>Seller Note</th>
+          <th>Total in 5 Years</th>
+          <th>Total in 10 Years</th>
+        </tr>
+      </thead>
+      <tbody>
+        <?php foreach ($offers as $offer):
+          $total5yr = $offer['down_payment'] + calculateTotalPayments($offer['seller_note_amount'], $offer['seller_note_rate'], $offer['seller_note_duration'], 60);
+          $total10yr = $offer['down_payment'] + calculateTotalPayments($offer['seller_note_amount'], $offer['seller_note_rate'], $offer['seller_note_duration'], 120);
+        ?>
+        <tr>
+          <td><strong><?php echo htmlspecialchars($offer['buyer_name']); ?></strong></td>
+          <td>$<?php echo number_format($offer['purchase_price'], 0); ?></td>
+          <td>$<?php echo number_format($offer['down_payment'], 0); ?></td>
+          <td>
+            $<?php echo number_format($offer['seller_note_amount'], 0); ?> @ <?php echo $offer['seller_note_rate']; ?>%
+            <?php if (!empty($offer['has_balloon'])): ?>
+              <br><span style="color:#f59e0b;font-size:0.85rem;">Balloon Yr <?php echo $offer['balloon_year'] ?? 5; ?></span>
+            <?php endif; ?>
+          </td>
+          <td>$<?php echo number_format($total5yr, 0); ?></td>
+          <td>$<?php echo number_format($total10yr, 0); ?></td>
+        </tr>
+        <?php endforeach; ?>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Offers Grid -->
+  <h2 style="margin-bottom:15px;">📝 Detailed Offer Comparison (<?php echo count($offers); ?> Offers)</h2>
+  <div style="margin-bottom:15px;">
+    <form method="POST" action="" style="display:inline;">
+      <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+      <input type="hidden" name="action" value="clear_all">
+      <button type="submit" class="btn btn-danger" onclick="return confirm('Are you sure you want to clear all offers?')">Clear All Offers</button>
+    </form>
+  </div>
+
+  <div class="offers-grid">
+    <?php
+    // Find best offer (highest total in 10 years)
+    $bestOfferId = null;
+    $bestTotal = 0;
+    foreach ($offers as $offer) {
+      $total = $offer['down_payment'] + calculateTotalPayments($offer['seller_note_amount'], $offer['seller_note_rate'], $offer['seller_note_duration'], 120);
+      if ($total > $bestTotal) {
+        $bestTotal = $total;
+        $bestOfferId = $offer['id'];
+      }
+    }
+
+    foreach ($offers as $offer):
+      $monthlyPayment = calculateMonthlyPayment($offer['seller_note_amount'], $offer['seller_note_rate'], $offer['seller_note_duration']);
+      $total5yr = $offer['down_payment'] + calculateTotalPayments($offer['seller_note_amount'], $offer['seller_note_rate'], $offer['seller_note_duration'], 60);
+      $total10yr = $offer['down_payment'] + calculateTotalPayments($offer['seller_note_amount'], $offer['seller_note_rate'], $offer['seller_note_duration'], 120);
+      $isBest = ($offer['id'] === $bestOfferId);
+    ?>
+    <div class="offer-card <?php echo $isBest ? 'best' : ''; ?>">
+      <div class="offer-header">
+        <h3><?php echo htmlspecialchars($offer['buyer_name']); ?></h3>
+        <div>
+          <a href="?edit_id=<?php echo $offer['id']; ?>" class="edit-btn" style="margin-right:8px;">Edit</a>
+          <form method="POST" action="" style="display:inline;">
+            <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+            <input type="hidden" name="action" value="delete_offer">
+            <input type="hidden" name="offer_id" value="<?php echo $offer['id']; ?>">
+            <button type="submit" class="delete-btn" onclick="return confirm('Delete this offer?')">Delete</button>
+          </form>
+        </div>
+      </div>
+
+      <div class="metric">
+        <div class="metric-label">💰 Cash at Closing</div>
+        <div class="metric-value highlight">$<?php echo number_format($offer['down_payment'], 0); ?></div>
+      </div>
+
+      <div class="metric">
+        <div class="metric-label">📄 Purchase Price</div>
+        <div class="metric-value">$<?php echo number_format($offer['purchase_price'], 0); ?></div>
+      </div>
+
+      <?php if ($offer['seller_note_amount'] > 0): ?>
+      <div class="metric">
+        <div class="metric-label">📝 Seller Note Terms</div>
+        <div class="metric-value" style="font-size:1.1rem;">
+          $<?php echo number_format($offer['seller_note_amount'], 0); ?><br>
+          <span style="font-size:0.85rem;color:var(--muted);">
+            <?php echo $offer['seller_note_rate']; ?>% interest, <?php echo $offer['seller_note_duration']; ?> months
+            <?php if (!empty($offer['has_balloon'])): ?>
+              <br>Balloon at Year <?php echo $offer['balloon_year'] ?? 5; ?>
+            <?php endif; ?>
+          </span>
+        </div>
+      </div>
+
+      <div class="metric">
+        <div class="metric-label">💳 Monthly Payment from Buyer</div>
+        <div class="metric-value" style="font-size:1.1rem;">$<?php echo number_format($monthlyPayment, 0); ?>/mo</div>
+      </div>
+      <?php endif; ?>
+
+      <div class="timeline-section">
+        <div class="metric">
+          <div class="metric-label">📅 Total Money in 5 Years</div>
+          <div class="metric-value" style="color:#06b6d4;">$<?php echo number_format($total5yr, 0); ?></div>
+        </div>
+
+        <div class="metric">
+          <div class="metric-label">📅 Total Money in 10 Years</div>
+          <div class="metric-value" style="color:#3b82f6;">$<?php echo number_format($total10yr, 0); ?></div>
+        </div>
+      </div>
+
+      <?php if (!empty($offer['contingencies'])): ?>
+      <div class="metric">
+        <div class="metric-label">⚠️ Contingencies / Notes</div>
+        <div style="font-size:0.9rem;color:var(--muted);"><?php echo nl2br(htmlspecialchars($offer['contingencies'])); ?></div>
+      </div>
+      <?php endif; ?>
+    </div>
+    <?php endforeach; ?>
+  </div>
+
+  <?php else: ?>
+  <div class="card">
+    <div class="empty-state">
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
+      </svg>
+      <h3>No Offers Yet</h3>
+      <p>Add your first offer above to start comparing</p>
+    </div>
+  </div>
+  <?php endif; ?>
+
+  <!-- Save/Load/Manage Section -->
+  <div class="card">
+    <h2>💾 Save or Load Comparison</h2>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px;">
+      <!-- Save Current Comparison -->
+      <div>
+        <h3 style="font-size:1rem;margin-bottom:10px;">Save Current Comparison</h3>
+        <?php if (count($offers) > 0): ?>
+        <form method="POST" action="" style="display:flex;gap:10px;">
+          <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+          <input type="hidden" name="action" value="save_comparison">
+          <input type="text" name="comparison_name" placeholder="Enter comparison name..." required style="flex:1;padding:10px;border-radius:8px;border:1px solid var(--border);">
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+        <?php else: ?>
+          <p style="color:var(--muted);font-size:0.9rem;">Add offers above to save a comparison.</p>
+        <?php endif; ?>
+      </div>
+
+      <!-- Load Saved Comparison -->
+      <div>
+        <h3 style="font-size:1rem;margin-bottom:10px;">Load Saved Comparison</h3>
+        <?php
+        $savedComparisons = getAllComparisons();
+        if (count($savedComparisons) > 0):
+        ?>
+        <form method="POST" action="" style="display:flex;gap:10px;">
+          <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+          <input type="hidden" name="action" value="load_comparison">
+          <select name="comparison_id" required style="flex:1;padding:10px;border-radius:8px;border:1px solid var(--border);">
+            <option value="">Select a comparison...</option>
+            <?php foreach ($savedComparisons as $comp): ?>
+              <option value="<?php echo $comp['id']; ?>" <?php echo ($_SESSION['current_comparison_id'] == $comp['id']) ? 'selected' : ''; ?>><?php echo htmlspecialchars($comp['name']); ?> (<?php echo $comp['offer_count']; ?> offers - <?php echo date('M d, Y', strtotime($comp['updated_at'])); ?>)</option>
+            <?php endforeach; ?>
+          </select>
+          <button type="submit" class="btn btn-primary">Load</button>
+        </form>
+        <?php else: ?>
+          <p style="color:var(--muted);font-size:0.9rem;">No saved comparisons yet.</p>
+        <?php endif; ?>
+      </div>
+    </div>
+
+    <!-- Manage Saved Comparisons -->
+    <?php if (count($savedComparisons) > 0): ?>
+    <div style="border-top:1px solid var(--border);padding-top:20px;">
+      <h3 style="font-size:1rem;margin-bottom:15px;">🗂️ Manage Saved Comparisons</h3>
+      <div style="display:grid;gap:10px;">
+        <?php foreach ($savedComparisons as $comp): ?>
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:12px;background:#f8f9fa;border-radius:8px;border:1px solid var(--border);">
+          <div>
+            <strong><?php echo htmlspecialchars($comp['name']); ?></strong>
+            <span style="color:var(--muted);font-size:0.85rem;margin-left:10px;">
+              <?php echo $comp['offer_count']; ?> offers | Last updated: <?php echo date('M d, Y g:i A', strtotime($comp['updated_at'])); ?>
+            </span>
+            <?php if ($_SESSION['current_comparison_id'] == $comp['id']): ?>
+              <span style="background:#10b981;color:white;padding:2px 8px;border-radius:4px;font-size:0.75rem;margin-left:10px;">LOADED</span>
+            <?php endif; ?>
+          </div>
+          <form method="POST" action="" style="display:inline;">
+            <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+            <input type="hidden" name="action" value="delete_comparison">
+            <input type="hidden" name="comparison_id" value="<?php echo $comp['id']; ?>">
+            <button type="submit" class="delete-btn" onclick="return confirm('Delete this comparison permanently?')">Delete</button>
+          </form>
+        </div>
+        <?php endforeach; ?>
+      </div>
+    </div>
+    <?php endif; ?>
+  </div>
+
+  <div class="footer">
+    Offer Comparison Tool v2.0 | © 2025 Rico Vision LLC
+  </div>
+</div>
+
+<?php if (count($offers) > 0): ?>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  // Check if Chart.js is loaded
+  if (typeof Chart === 'undefined') {
+    console.error('Chart.js library not loaded');
+    return;
+  }
+
+  // Prepare data for the chart
+  const offers = <?php echo json_encode($offers); ?>;
+
+  // Generate timeline data (monthly data points for 120 months / 10 years)
+  const months = Array.from({length: 121}, (_, i) => i); // 0 to 120
+
+  const datasets = offers.map((offer, index) => {
+    const colors = [
+      '#06b6d4', // cyan
+      '#8b5cf6', // purple
+      '#f59e0b', // amber
+      '#10b981', // green
+      '#ef4444', // red
+      '#ec4899', // pink
+      '#14b8a6', // teal
+      '#f97316', // orange
+      '#6366f1', // indigo
+      '#84cc16', // lime
+    ];
+
+    const color = colors[index % colors.length];
+
+    // Calculate cumulative cash received over time
+    const monthlyPayment = offer.seller_note_amount > 0
+      ? (offer.seller_note_amount * ((offer.seller_note_rate / 100 / 12) * Math.pow(1 + (offer.seller_note_rate / 100 / 12), offer.seller_note_duration)) / (Math.pow(1 + (offer.seller_note_rate / 100 / 12), offer.seller_note_duration) - 1))
+      : 0;
+
+    const data = months.map(month => {
+      if (month === 0) {
+        return offer.down_payment;
+      }
+
+      // Check if there's a balloon payment
+      const balloonMonth = offer.has_balloon ? (offer.balloon_year || 5) * 12 : offer.seller_note_duration;
+
+      if (offer.has_balloon && month >= balloonMonth) {
+        // Calculate balloon: remaining balance at balloon month
+        const monthlyRate = (offer.seller_note_rate / 100) / 12;
+        const paymentsBeforeBalloon = Math.min(month, balloonMonth);
+        const remainingBalance = offer.seller_note_amount > 0 && monthlyRate > 0
+          ? (offer.seller_note_amount * Math.pow(1 + monthlyRate, paymentsBeforeBalloon) - monthlyPayment * ((Math.pow(1 + monthlyRate, paymentsBeforeBalloon) - 1) / monthlyRate))
+          : 0;
+
+        return offer.down_payment + (monthlyPayment * paymentsBeforeBalloon) + remainingBalance;
+      } else {
+        const paymentsReceived = Math.min(month, offer.seller_note_duration);
+        return offer.down_payment + (monthlyPayment * paymentsReceived);
+      }
+    });
+
+    return {
+      label: offer.buyer_name,
+      data: data,
+      borderColor: color,
+      backgroundColor: color + '20',
+      borderWidth: 3,
+      fill: true,
+      tension: 0.4
+    };
+  });
+
+  const ctx = document.getElementById('cashflowChart');
+  if (!ctx) {
+    console.error('Canvas element not found');
+    return;
+  }
+
+  const chart = new Chart(ctx.getContext('2d'), {
+    type: 'line',
+    data: {
+      labels: months,
+      datasets: datasets
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      interaction: {
+        mode: 'index',
+        intersect: false,
+      },
+      plugins: {
+        title: {
+          display: true,
+          text: 'Cumulative Cash Received Over Time',
+          font: {
+            size: 16,
+            weight: 'bold'
+          }
+        },
+        legend: {
+          display: true,
+          position: 'top',
+        },
+        tooltip: {
+          callbacks: {
+            label: function(context) {
+              let label = context.dataset.label || '';
+              if (label) {
+                label += ': ';
+              }
+              label += '$' + context.parsed.y.toLocaleString('en-US', {maximumFractionDigits: 0});
+              return label;
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          title: {
+            display: true,
+            text: 'Months from Closing',
+            font: {
+              size: 14,
+              weight: 'bold'
+            }
+          },
+          ticks: {
+            maxTicksLimit: 13,
+            callback: function(value, index, values) {
+              if (value % 12 === 0) {
+                return 'Year ' + (value / 12);
+              }
+              return '';
+            }
+          }
+        },
+        y: {
+          title: {
+            display: true,
+            text: 'Total Cash Received ($)',
+            font: {
+              size: 14,
+              weight: 'bold'
+            }
+          },
+          ticks: {
+            callback: function(value, index, values) {
+              return '$' + value.toLocaleString('en-US', {maximumFractionDigits: 0});
+            }
+          }
+        }
+      }
+    }
+  });
+});
+</script>
+<?php endif; ?>
+
+<script>
+// Toggle balloon year field visibility
+function toggleBalloonYear() {
+  const checkbox = document.getElementById('has_balloon');
+  const balloonYearGroup = document.getElementById('balloon_year_group');
+
+  if (checkbox.checked) {
+    balloonYearGroup.style.display = 'flex';
+  } else {
+    balloonYearGroup.style.display = 'none';
+  }
+}
+
+// Validate offer before submission
+function validateOffer() {
+  // Get values (use defaults if empty, but allow 0 as valid)
+  const purchasePriceInput = document.getElementById('purchase_price').value;
+  const downPaymentInput = document.getElementById('down_payment').value;
+  const sellerNoteInput = document.getElementById('seller_note_amount').value;
+
+  const purchasePrice = purchasePriceInput !== '' ? parseFloat(purchasePriceInput) : 1000000;
+  const downPayment = downPaymentInput !== '' ? parseFloat(downPaymentInput) : 750000;
+  const sellerNoteAmount = sellerNoteInput !== '' ? parseFloat(sellerNoteInput) : 250000;
+
+  // Check if cash + note = purchase price
+  const total = downPayment + sellerNoteAmount;
+
+  if (Math.abs(total - purchasePrice) > 0.01) { // Allow for small floating point differences
+    alert(`Warning: Cash at Closing ($${downPayment.toLocaleString()}) + Seller Note ($${sellerNoteAmount.toLocaleString()}) = $${total.toLocaleString()}\n\nThis does not equal the Purchase Price of $${purchasePrice.toLocaleString()}.\n\nPlease adjust the amounts so they add up to the purchase price.`);
+    return false; // Prevent form submission
+  }
+
+  return true; // Allow form submission
+}
+
+// Initialize on page load
+document.addEventListener('DOMContentLoaded', function() {
+  toggleBalloonYear();
+});
+</script>
+</body>
+</html>

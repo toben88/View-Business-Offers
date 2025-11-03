@@ -1,4 +1,4 @@
-# Offer Comparison Tool v2.0
+# Offer Comparison Tool v2.01
 
 A production-ready web application for business sellers to compare multiple acquisition offers side-by-side. Features interactive visualizations, seller note tracking with balloon payments, and persistent data storage.
 
@@ -23,7 +23,7 @@ A production-ready web application for business sellers to compare multiple acqu
 
 ```
 buyeroffers/
-├── viewoffers.php         # Main application (v2.0)
+├── index.php         # Main application (v2.01)
 ├── database.php           # SQLite database handler
 ├── data/                  # Database storage directory (auto-created)
 │   ├── .htaccess         # Blocks direct web access to database
@@ -46,7 +46,7 @@ buyeroffers/
 1. **Upload Files**: Upload the entire `buyeroffers` folder to your web server
 2. **Set Permissions**: Configure file permissions (see Security section below)
 3. **Verify .htaccess**: Ensure `.htaccess` file exists in `data/` directory to block direct access
-4. **Access Application**: Navigate to `https://yourserver.com/buyeroffers/viewoffers.php`
+4. **Access Application**: Navigate to `https://yourserver.com/buyeroffers/index.php`
 5. **Test**: Add a test offer and verify database creation in `data/offers.db`
 
 ### Development Setup
@@ -58,7 +58,7 @@ cd /path/to/buyeroffers
 # Start PHP built-in server (development only)
 php -S localhost:8000
 
-# Access at: http://localhost:8000/viewoffers.php
+# Access at: http://localhost:8000/index.php
 ```
 
 ## Security Features (Production Ready)
@@ -209,7 +209,14 @@ Before deploying to production:
 
 ## Version History
 
-### v2.0 (Current)
+### v2.01 (Current)
+- **Auto-save functionality**: Automatically saves to database after every add/edit/delete operation
+- **Cross-browser/computer sync**: Always loads most recent comparison from database on page load
+- **Fixed edit button**: Resolved issue with editing offers loaded from database
+- **Renamed to index.php**: Changed main file from viewoffers.php to index.php
+- All browsers and devices now see synchronized data in real-time
+
+### v2.0
 - Added database persistence with SQLite
 - Implemented save/load/manage comparisons
 - Added auto-load of most recent comparison

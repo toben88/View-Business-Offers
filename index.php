@@ -1,7 +1,7 @@
 <?php
 /*
  * ============================================
- * OFFER COMPARISON TOOL FOR SELLERS v2.0
+ * OFFER COMPARISON TOOL FOR SELLERS v2.01
  * ============================================
  *
  * Purpose: Help sellers compare multiple offers side-by-side
@@ -97,6 +97,61 @@ if (!isset($_SESSION['offers'])) {
     $_SESSION['offers'] = [];
 }
 
+// Auto-save helper function - saves current offers to database automatically
+function autoSaveComparison() {
+    if (count($_SESSION['offers']) > 0) {
+        $comparisonName = "Auto-saved " . date('Y-m-d H:i:s');
+        
+        // If we have a current comparison loaded, update it instead of creating new
+        if (!empty($_SESSION['current_comparison_id'])) {
+            try {
+                // Delete old offers for this comparison
+                $db = getDatabase();
+                $stmt = $db->prepare("DELETE FROM offers WHERE comparison_id = ?");
+                $stmt->execute([$_SESSION['current_comparison_id']]);
+                
+                // Re-insert current offers
+                $stmt = $db->prepare("
+                    INSERT INTO offers (
+                        comparison_id, buyer_name, purchase_price, down_payment,
+                        seller_note_amount, seller_note_rate, seller_note_duration,
+                        has_balloon, balloon_year, contingencies
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ");
+                
+                foreach ($_SESSION['offers'] as $offer) {
+                    $stmt->execute([
+                        $_SESSION['current_comparison_id'],
+                        $offer['buyer_name'],
+                        $offer['purchase_price'],
+                        $offer['down_payment'],
+                        $offer['seller_note_amount'],
+                        $offer['seller_note_rate'],
+                        $offer['seller_note_duration'],
+                        $offer['has_balloon'] ? 1 : 0,
+                        $offer['balloon_year'] ?? 5,
+                        $offer['contingencies'] ?? null
+                    ]);
+                }
+                
+                // Update timestamp
+                touchComparison($_SESSION['current_comparison_id']);
+            } catch (Exception $e) {
+                // Silently fail
+            }
+        } else {
+            // No current comparison - create new one
+            try {
+                $comparisonId = saveComparison($comparisonName, $_SESSION['offers']);
+                $_SESSION['current_comparison_id'] = $comparisonId;
+            } catch (Exception $e) {
+                // Silently fail
+            }
+        }
+    }
+}
+
+
 // Security: Input validation function
 function validateOfferInput($data) {
     $errors = [];
@@ -187,7 +242,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['csrf_token']) && $_PO
         $validationErrors = validateOfferInput($_POST);
         if (!empty($validationErrors)) {
             $_SESSION['error_message'] = implode(' | ', $validationErrors);
-            header('Location: viewoffers.php');
+            header('Location: index.php');
             exit;
         }
 
@@ -204,17 +259,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['csrf_token']) && $_PO
             'contingencies' => strip_tags($_POST['contingencies'] ?? ''),
         ];
         $_SESSION['offers'][] = $offer;
+        autoSaveComparison(); // Auto-save after adding offer
     } elseif ($action === 'delete_offer' && isset($_POST['offer_id'])) {
         $_SESSION['offers'] = array_filter($_SESSION['offers'], function($o) {
             return $o['id'] !== $_POST['offer_id'];
         });
         $_SESSION['offers'] = array_values($_SESSION['offers']); // Re-index
     } elseif ($action === 'update_offer' && isset($_POST['offer_id'])) {
+        autoSaveComparison(); // Auto-save after deleting offer
         // Validate input
         $validationErrors = validateOfferInput($_POST);
         if (!empty($validationErrors)) {
             $_SESSION['error_message'] = implode(' | ', $validationErrors);
-            header('Location: viewoffers.php');
+            header('Location: index.php');
             exit;
         }
 
@@ -234,9 +291,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['csrf_token']) && $_PO
                 break;
             }
         }
+        autoSaveComparison(); // Auto-save after editing offer
         unset($offer); // Break the reference
         // Redirect to clear the edit mode and prevent re-submission
-        header('Location: viewoffers.php');
+        header('Location: index.php');
         exit;
     } elseif ($action === 'clear_all') {
         $_SESSION['offers'] = [];
@@ -246,7 +304,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['csrf_token']) && $_PO
         $validationErrors = validateOfferInput($_POST);
         if (!empty($validationErrors)) {
             $_SESSION['error_message'] = implode(' | ', $validationErrors);
-            header('Location: viewoffers.php');
+            header('Location: index.php');
             exit;
         }
 
@@ -261,7 +319,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['csrf_token']) && $_PO
                 $_SESSION['error_message'] = "Error saving comparison. Please try again.";
             }
         }
-        header('Location: viewoffers.php');
+        header('Location: index.php');
         exit;
     } elseif ($action === 'load_comparison' && !empty($_POST['comparison_id'])) {
         // Load comparison from database
@@ -278,7 +336,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['csrf_token']) && $_PO
         } catch (Exception $e) {
             $_SESSION['error_message'] = "Error loading comparison. Please try again.";
         }
-        header('Location: viewoffers.php');
+        header('Location: index.php');
         exit;
     } elseif ($action === 'delete_comparison' && !empty($_POST['comparison_id'])) {
         // Delete comparison from database
@@ -293,7 +351,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['csrf_token']) && $_PO
         } catch (Exception $e) {
             $_SESSION['error_message'] = "Error deleting comparison. Please try again.";
         }
-        header('Location: viewoffers.php');
+        header('Location: index.php');
         exit;
     }
 }
@@ -313,25 +371,29 @@ function calculateTotalPayments($principal, $annualRate, $months, $timeframe) {
     return $monthlyPayment * $actualMonths;
 }
 
-$offers = $_SESSION['offers'] ?? [];
-
-// Auto-load first comparison if no offers and no current comparison loaded
-if (count($offers) === 0 && $_SESSION['current_comparison_id'] === null) {
-    $savedComparisons = getAllComparisons();
-    if (count($savedComparisons) > 0) {
-        $firstComparison = $savedComparisons[0];
-        try {
-            $data = loadComparison($firstComparison['id']);
-            if ($data) {
-                $_SESSION['offers'] = $data['offers'];
-                $_SESSION['current_comparison_id'] = $firstComparison['id'];
-                $offers = $_SESSION['offers'];
-            }
-        } catch (Exception $e) {
-            // Silently fail - just don't load anything
+// Always load the most recent comparison from database (for cross-browser/computer sync)
+// This ensures all sessions see the same data
+$savedComparisons = getAllComparisons();
+if (count($savedComparisons) > 0) {
+    $mostRecentComparison = $savedComparisons[0]; // Already sorted by updated_at DESC
+    try {
+        $data = loadComparison($mostRecentComparison['id']);
+        if ($data) {
+            $_SESSION['offers'] = $data['offers'];
+            $_SESSION['current_comparison_id'] = $mostRecentComparison['id'];
         }
+    } catch (Exception $e) {
+        // Silently fail - use empty offers
+        $_SESSION['offers'] = [];
+        $_SESSION['current_comparison_id'] = null;
     }
+} else {
+    // No saved comparisons - start fresh
+    $_SESSION['offers'] = [];
+    $_SESSION['current_comparison_id'] = null;
 }
+
+$offers = $_SESSION['offers'] ?? [];
 
 // Check if we're in edit mode
 $editingOffer = null;
@@ -463,7 +525,7 @@ html,body{height:100%;font-family:Inter,system-ui,-apple-system; background:var(
   <div class="card">
     <h2><?php echo $editingOffer ? '✏️ Edit Offer' : '➕ Add New Offer'; ?></h2>
     <?php if ($editingOffer): ?>
-      <p style="color:#06b6d4;margin-bottom:15px;">Editing: <strong><?php echo htmlspecialchars($editingOffer['buyer_name']); ?></strong> | <a href="viewoffers.php" style="color:#ef4444;">Cancel</a></p>
+      <p style="color:#06b6d4;margin-bottom:15px;">Editing: <strong><?php echo htmlspecialchars($editingOffer['buyer_name']); ?></strong> | <a href="index.php" style="color:#ef4444;">Cancel</a></p>
     <?php endif; ?>
     <form method="POST" action="">
       <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
@@ -524,7 +586,7 @@ html,body{height:100%;font-family:Inter,system-ui,-apple-system; background:var(
       <div style="margin-top:15px;">
         <button type="submit" class="btn btn-success" onclick="return validateOffer()"><?php echo $editingOffer ? 'Update Offer' : 'Add Offer to Comparison'; ?></button>
         <?php if ($editingOffer): ?>
-          <a href="viewoffers.php" class="btn btn-ghost" style="margin-left:10px;">Cancel</a>
+          <a href="index.php" class="btn btn-ghost" style="margin-left:10px;">Cancel</a>
         <?php endif; ?>
       </div>
     </form>
@@ -755,7 +817,7 @@ html,body{height:100%;font-family:Inter,system-ui,-apple-system; background:var(
   </div>
 
   <div class="footer">
-    Offer Comparison Tool v2.0 | © 2025 Rico Vision LLC
+    Offer Comparison Tool v2.01 | © 2025 Rico Vision LLC
   </div>
 </div>
 
